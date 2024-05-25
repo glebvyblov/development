@@ -38,7 +38,55 @@ TReadActor
             ...
 */
 
-// TODO: напишите реализацию TReadActor
+class TReadActor : public NActors::TActorBootstrapped<TReadActor> {
+public:
+    explicit TReadActor(const NActors::TActorId& writer_id)
+        : writer_id_(writer_id), not_processed_tasks_(), is_io_stream_empty_()
+    {}
+
+    void Bootstrap() {
+        Become(&TReadActor::StateFunc);
+        Send(SelfId(), std::make_unique<NActors::TEvents::TEvWakeup>());
+    }
+
+private:
+    void ProcessReadData(int64_t value) {
+        Register(CreateMaximumPrimeDevisorActor(value, SelfId(), writer_id_).Release());
+        ++not_processed_tasks_;
+        Send(SelfId(), std::make_unique<NActors::TEvents::TEvWakeup>());
+    }
+
+    void ProcessEOF() {
+        if (!not_processed_tasks_) {
+            Send(writer_id_, std::make_unique<NActors::TEvents::TEvPoisonPill>());
+            PassAway();
+        }
+    }
+
+    void ControlWakeUpEvent() {
+        int64_t value;
+        if (std::cin >> value) {
+            return (void) ProcessReadData(value);
+        }
+        is_io_stream_empty_ = true;
+        ProcessEOF();
+    }
+
+    void ControlJobEndEvent() {
+        if (--not_processed_tasks_ == 0 && is_io_stream_empty_) {
+            ProcessEOF();
+        }
+    }
+
+    STRICT_STFUNC(StateFunc,
+          cFunc(TEvents::TEventJobEnd::EventType, ControlJobEndEvent)
+          cFunc(NActors::TEvents::TEvWakeup::EventType, ControlWakeUpEvent)
+    );
+
+    const NActors::TActorId writer_id_;
+    std::size_t not_processed_tasks_;
+    bool is_io_stream_empty_;
+};
 
 /*
 Требования к TMaximumPrimeDevisorActor:
@@ -68,7 +116,65 @@ TMaximumPrimeDevisorActor
             PassAway()
 */
 
-// TODO: напишите реализацию TMaximumPrimeDevisorActor
+
+class TMaximumPrimeDevisorActor : public NActors::TActorBootstrapped<TMaximumPrimeDevisorActor> {
+public:
+    TMaximumPrimeDevisorActor(int64_t value, const NActors::TActorId &reader_id, const NActors::TActorId &writer_id)
+        : current_i_(2),
+          current_value_(value),
+          answer_(),
+          initial_value_(value),
+          reader_id_(reader_id),
+          writer_id(writer_id)
+    {}
+
+    void Bootstrap() {
+        Become(&TMaximumPrimeDevisorActor::StateFunc);
+        Send(SelfId(), std::make_unique<NActors::TEvents::TEvWakeup>());
+    }
+
+private:
+    bool CheckTimeout(const auto &expire_time) const {
+        if (std::chrono::system_clock::now() >= expire_time) {
+            Send(SelfId(), std::make_unique<NActors::TEvents::TEvWakeup>());
+            return true;
+        }
+        return false;
+    }
+
+    void ControlWakeUpEvent() {
+        const auto expire_time = std::chrono::system_clock::now() + timeout;
+        for (; current_value_ > 1 && current_i_ * current_i_ <= initial_value_; ++current_i_) {
+            while (current_value_ % current_i_ == 0) {
+                answer_ = current_i_;
+                current_value_ /= current_i_;
+                if (CheckTimeout(expire_time)) {
+                    return;
+                }
+            }
+            if (CheckTimeout(expire_time)) {
+                return;
+            }
+        }
+        answer_ = std::max(answer_, current_value_);
+        Send(writer_id, std::make_unique<TEvents::TEventWrite>(answer_));
+        Send(reader_id_, std::make_unique<TEvents::TEventJobEnd>());
+        PassAway();
+    }
+
+    STRICT_STFUNC(StateFunc,
+          cFunc(NActors::TEvents::TEvWakeup::EventType, ControlWakeUpEvent)
+    );
+
+    constexpr static auto timeout = std::chrono::milliseconds(10);
+
+    int64_t current_i_;
+    int64_t current_value_;
+    int64_t answer_;
+    const int64_t initial_value_;
+    const NActors::TActorId reader_id_;
+    const NActors::TActorId writer_id;
+};
 
 /*
 Требования к TWriteActor:
@@ -87,7 +193,30 @@ TWriteActor
         PassAway()
 */
 
-// TODO: напишите реализацию TWriteActor
+class TWriteActor : public NActors::TActor<TWriteActor> {
+public:
+    TWriteActor()
+        : NActors::TActor<TWriteActor>(&TWriteActor::StateFunc), summary_()
+    {}
+
+private:
+    void ControlWriteMessageEvent(const TEvents::TEventWrite::TPtr& ptr) {
+        summary_ += ptr->Get()->GetValue();
+    }
+
+    void ControlPoisonPill() {
+        std::cout << summary_ << std::endl;
+        ShouldContinue->ShouldStop();
+        PassAway();
+    }
+
+    STRICT_STFUNC(StateFunc,
+          hFunc(TEvents::TEventWrite, ControlWriteMessageEvent)
+          cFunc(NActors::TEvents::TEvPoisonPill::EventType, ControlPoisonPill)
+    );
+
+    int64_t summary_;
+};
 
 class TSelfPingActor : public NActors::TActorBootstrapped<TSelfPingActor> {
     TDuration Latency;
@@ -116,6 +245,18 @@ public:
         Send(SelfId(), std::make_unique<NActors::TEvents::TEvWakeup>());
     }
 };
+
+THolder<NActors::IActor> CreateReadActor(const NActors::TActorId& writer_id) {
+    return MakeHolder<TReadActor>(writer_id);
+}
+
+THolder<NActors::IActor> CreateMaximumPrimeDevisorActor(int64_t value, const NActors::TActorId& reader_id, const NActors::TActorId& writer_id) {
+    return MakeHolder<TMaximumPrimeDevisorActor>(value, reader_id, writer_id);
+}
+
+THolder<NActors::IActor> CreateWriteActor() {
+    return MakeHolder<TWriteActor>();
+}
 
 THolder<NActors::IActor> CreateSelfPingActor(const TDuration& latency) {
     return MakeHolder<TSelfPingActor>(latency);
